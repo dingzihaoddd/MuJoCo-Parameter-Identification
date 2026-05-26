@@ -21,9 +21,12 @@ class Simulator:
         MuJoCo XML 模型文件路径。
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, timestep: float | None = None):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
+
+        if timestep is not None:
+            self._model.opt.timestep = timestep
 
         # 预计算模型元素的索引
         self._body_link_id = mujoco.mj_name2id(
