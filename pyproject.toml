@@ -1,0 +1,11 @@
+[project]
+name = "mujoco-param-id"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.7.0",
+    "mujoco>=3.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+]

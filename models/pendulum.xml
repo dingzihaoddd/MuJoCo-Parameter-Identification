@@ -1,0 +1,41 @@
+<!--
+  单关节摆锤模型 — 用于动力学参数辨识
+  可辨识参数: 连杆质量、关节阻尼、关节摩擦、电枢惯量
+-->
+<mujoco model="pendulum">
+  <compiler angle="radian" />
+
+  <option timestep="0.001" integrator="RK4">
+    <flag gravity="enable" />
+  </option>
+
+  <default>
+    <geom rgba="0.3 0.5 0.8 1" />
+    <joint limited="false" />
+  </default>
+
+  <worldbody>
+    <!-- 基座 (固定) -->
+    <body name="base" pos="0 0 0">
+      <geom name="base_geom" type="cylinder" size="0.05 0.02" mass="0" />
+    </body>
+
+    <!-- 摆锤连杆 -->
+    <body name="link" pos="0 0 0">
+      <joint name="hinge" type="hinge" axis="0 1 0"
+             damping="0.1" frictionloss="0.05" armature="0.01" />
+      <geom name="link_geom" type="cylinder" size="0.02 0.5" pos="0 0 -0.25"
+            mass="1.0" />
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="motor" joint="hinge" ctrlrange="-100 100" />
+  </actuator>
+
+  <sensor>
+    <jointpos name="q"  joint="hinge" />
+    <jointvel name="qd" joint="hinge" />
+    <actuatorfrc name="tau" actuator="motor" />
+  </sensor>
+</mujoco>
