@@ -147,10 +147,12 @@ class Simulator:
 
         q_traj = np.empty(N)
         qd_traj = np.empty(N)
+        qdd_traj = np.empty(N)  # 同步记录加速度
 
         for i in range(N):
             self.step(float(tau_seq[i]))
             q_traj[i] = self._data.qpos[0]
             qd_traj[i] = self._data.qvel[0]
+            qdd_traj[i] = self._data.qacc[0]
 
-        return {"q": q_traj, "qd": qd_traj, "tau": tau_seq.copy()}
+        return {"q": q_traj, "qd": qd_traj, "qdd": qdd_traj, "tau": tau_seq.copy()}
