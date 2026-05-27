@@ -43,7 +43,15 @@ INITIAL_GUESS = [0.12, 0.06]  # 初始猜测 [damping, frictionloss]
 OPT_EPS = 0.02                 # 有限差分梯度步长
 OPT_MAXITER = 200              # 最大迭代次数
 OPT_BOUNDS = [(0.001, 0.5), (0.001, 0.3)]  # [damping, frictionloss] 搜索边界
-SUCCESS_THRESHOLD = 10         # 成功率阈值 (%)
+SUCCESS_THRESHOLD = 5         # 成功率阈值 (%)
+
+# 多轮重启: 每轮收敛后用更小的 eps 从当前最优继续搜索
+# eps 逐步缩小才能在狭窄谷底感知梯度
+EPS_SCHEDULE = [0.02, 0.01, 0.005, 0.002]
+
+# 扰动跳出: 收敛后若未改善则在当前点附近随机试探
+PERTURB_COUNT = 5       # 每轮的随机扰动次数
+PERTURB_SCALE = 0.05    # 扰动幅度（相对当前值的比例）
 
 # ═══════════════════════════════════════════════════════════════
 # 路径
@@ -96,20 +104,18 @@ def _fmt(d, f, loss):
     return f"d={d:.4f}({de:5.1f}%) f={f:.4f}({fe:5.1f}%) loss={loss:.6e}{ok}"
 
 
-def _save_txt(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
+def _save_txt(result_dir, d, f, d_err, f_err, loss, opt_info, history, t_total, t1):
     path = os.path.join(result_dir, "results.txt")
     with open(path, "w", encoding="utf-8") as fp:
         fp.write("参数辨识优化结果\n")
         fp.write("=" * 60 + "\n\n")
-        fp.write(f"优化方法: {OPT_METHOD} (eps={OPT_EPS})\n")
+        fp.write(f"优化方法: {OPT_METHOD} (eps={opt_info['eps_schedule']})\n")
         fp.write(f"仿真步长: {SIM_DT}s, 时长: {DUR}s\n")
         fp.write(f"初始角度: {MULTI_Q0_DEG} deg\n")
         fp.write(f"激励信号: {EXCITATION} freq={EXCITATION_FREQ}Hz amp={EXCITATION_AMP}\n")
         fp.write(f"初始猜测: d={INITIAL_GUESS[0]}, f={INITIAL_GUESS[1]}\n\n")
         fp.write(f"最终损失: {loss:.6e}\n")
-        fp.write(f"迭代次数: {r.nit}\n")
-        fp.write(f"函数调用: {r.nfev}\n")
-        fp.write(f"优化状态: {r.message}\n")
+        fp.write(f"总函数调用: {opt_info['total_nfev']}\n")
         fp.write(f"优化耗时: {time.time() - t1:.1f}s\n")
         fp.write(f"总耗时: {time.time() - t_total:.1f}s\n\n")
         fp.write(f"{'参数':<15s} {'真实值':>10s} {'辨识值':>10s} {'误差%':>10s}\n")
@@ -129,7 +135,7 @@ def _save_txt(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
     print(f"  文本结果: {path}")
 
 
-def _save_json(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
+def _save_json(result_dir, d, f, d_err, f_err, loss, opt_info, history, t_total, t1):
     path = os.path.join(result_dir, "result.json")
     result = {
         "true_params": {"damping": TRUE_DAMPING, "frictionloss": TRUE_FRICTION},
@@ -145,9 +151,8 @@ def _save_json(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
         },
         "timing": {"total_s": round(time.time() - t_total, 2), "optimization_s": round(time.time() - t1, 2)},
         "optimization": {
-            "method": OPT_METHOD, "eps": OPT_EPS, "maxiter": OPT_MAXITER,
-            "initial_guess": INITIAL_GUESS,
-            "nit": int(r.nit), "nfev": int(r.nfev), "message": str(r.message),
+            "method": OPT_METHOD, "eps_schedule": opt_info["eps_schedule"],
+            "initial_guess": INITIAL_GUESS, "total_nfev": opt_info["total_nfev"],
         },
         "history": history,
     }
@@ -246,26 +251,65 @@ def main():
     print(f"数据: {len(packed['tau_seq'])} 点 [{time.time() - t_total:.1f}s]")
     print(f"真值校验: loss={_trajectory_loss(TRUE_DAMPING, TRUE_FRICTION, packed):.6e}")
 
-    print(f"\n=== {OPT_METHOD} (eps={OPT_EPS}) ===")
     t1 = time.time()
 
+    x_cur = np.array(INITIAL_GUESS, dtype=float)
+    loss_cur = _trajectory_loss(x_cur[0], x_cur[1], packed)
     history = []
-    def callback(xk):
-        loss = _trajectory_loss(xk[0], xk[1], packed)
-        history.append({"d": float(xk[0]), "f": float(xk[1]), "loss": loss})
-        print(f"  iter {len(history):3d}: {_fmt(xk[0], xk[1], loss)}")
+    total_nfev = 0
 
-    r = minimize(
-        lambda x: _trajectory_loss(x[0], x[1], packed),
-        INITIAL_GUESS, method=OPT_METHOD, bounds=OPT_BOUNDS,
-        options={"maxiter": OPT_MAXITER, "eps": OPT_EPS},
-        callback=callback,
-    )
-    d_final, f_final = r.x
-    loss_final = r.fun
+    for round_idx, eps in enumerate(EPS_SCHEDULE):
+        round_label = f"Round {round_idx + 1}/{len(EPS_SCHEDULE)}"
+        print(f"\n=== {OPT_METHOD} {round_label} (eps={eps}) ===")
+
+        # 扰动试探：在当前点附近随机采样，找更低 loss 的起点
+        best_loss_before = loss_cur
+        for k in range(PERTURB_COUNT):
+            scale = np.array([OPT_BOUNDS[0][1] - OPT_BOUNDS[0][0],
+                              OPT_BOUNDS[1][1] - OPT_BOUNDS[1][0]])
+            noise = np.random.randn(2) * PERTURB_SCALE * scale
+            x_try = np.clip(x_cur + noise,
+                            [OPT_BOUNDS[0][0], OPT_BOUNDS[1][0]],
+                            [OPT_BOUNDS[0][1], OPT_BOUNDS[1][1]])
+            loss_try = _trajectory_loss(x_try[0], x_try[1], packed)
+            total_nfev += 1
+            if loss_try < loss_cur:
+                print(f"  扰动{k + 1}: {_fmt(x_try[0], x_try[1], loss_try)} <- 更好!")
+                x_cur = x_try
+                loss_cur = loss_try
+
+        round_history_len = len(history)
+        def callback(xk):
+            loss = _trajectory_loss(xk[0], xk[1], packed)
+            history.append({"d": float(xk[0]), "f": float(xk[1]), "loss": loss, "eps": eps})
+            rn = len(history) - round_history_len
+            print(f"  iter {rn:3d}: {_fmt(xk[0], xk[1], loss)}")
+
+        r = minimize(
+            lambda x: _trajectory_loss(x[0], x[1], packed),
+            x_cur, method=OPT_METHOD, bounds=OPT_BOUNDS,
+            options={"maxiter": OPT_MAXITER, "eps": eps},
+            callback=callback,
+        )
+        total_nfev += r.nfev
+        if r.fun < loss_cur:
+            x_cur = r.x
+            loss_cur = r.fun
+        print(f"  -> {_fmt(x_cur[0], x_cur[1], loss_cur)}")
+
+        # 提前退出：误差已达标
+        d_cur = abs(x_cur[0] - TRUE_DAMPING) / TRUE_DAMPING * 100
+        f_cur = abs(x_cur[1] - TRUE_FRICTION) / TRUE_FRICTION * 100
+        if d_cur < SUCCESS_THRESHOLD and f_cur < SUCCESS_THRESHOLD:
+            print(f"  *** 精度达标 (eps={eps}) ***")
+            break
+
+    d_final, f_final = x_cur
+    loss_final = loss_cur
 
     print(f"\n  初始: ({INITIAL_GUESS[0]}, {INITIAL_GUESS[1]})")
     print(f"  结果: {_fmt(d_final, f_final, loss_final)}")
+    print(f"  总函数调用: {total_nfev}")
     print(f"  优化耗时: {time.time() - t1:.1f}s")
 
     d_err = abs(d_final - TRUE_DAMPING) / TRUE_DAMPING * 100
@@ -276,8 +320,9 @@ def main():
     result_dir = os.path.join(RESULTS_DIR, timestamp)
     os.makedirs(result_dir, exist_ok=True)
 
-    _save_txt(result_dir, d_final, f_final, d_err, f_err, loss_final, r, history, t_total, t1)
-    _save_json(result_dir, d_final, f_final, d_err, f_err, loss_final, r, history, t_total, t1)
+    opt_info = {"method": OPT_METHOD, "eps_schedule": EPS_SCHEDULE, "total_nfev": total_nfev}
+    _save_txt(result_dir, d_final, f_final, d_err, f_err, loss_final, opt_info, history, t_total, t1)
+    _save_json(result_dir, d_final, f_final, d_err, f_err, loss_final, opt_info, history, t_total, t1)
     _plot_results(result_dir, packed, d_final, f_final)
 
     print(f"\n结果已保存: {result_dir}")
