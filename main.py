@@ -96,6 +96,8 @@ def main():
             maxiter=50,
             seed=seed,
             verbose=False,
+            segments=data.get("segments"),
+            segment_len=data.get("segment_len"),
         )
         loss = result["opt_result"].fun
         params = result["recovered_params"]
@@ -174,7 +176,20 @@ def _plot_results(result_dir, data, result, sim, true_params):
     plt.rcParams["axes.unicode_minus"] = False
 
     sim.set_params(result["recovered_params"])
-    pred = sim.run(data["tau_seq"], q0=np.deg2rad(30), qd0=0.0)
+    # 多段数据：分别用每段初始条件仿真
+    if "segments" in data and data["segments"] is not None:
+        q_list, qd_list = [], []
+        for seg_idx, (seg_q0, seg_qd0) in enumerate(data["segments"]):
+            n = data["segment_len"]
+            seg_tau = data["tau_seq"][seg_idx*n:(seg_idx+1)*n]
+            traj = sim.run(seg_tau, seg_q0, seg_qd0)
+            q_list.append(traj["q"])
+            qd_list.append(traj["qd"])
+        q_pred = np.concatenate(q_list)
+        qd_pred = np.concatenate(qd_list)
+        pred = {"q": q_pred, "qd": qd_pred}
+    else:
+        pred = sim.run(data["tau_seq"], q0=np.deg2rad(30), qd0=0.0)
 
     t = np.arange(len(data["tau_seq"])) * data["dt"]
 

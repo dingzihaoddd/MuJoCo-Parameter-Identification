@@ -40,6 +40,8 @@ def identify_params(
     maxiter: int = 500,
     seed: int | None = None,
     verbose: bool = True,
+    segments: list | None = None,
+    segment_len: int | None = None,
 ) -> dict:
     """通过梯度下降从轨迹数据中辨识动力学参数。
 
@@ -130,6 +132,8 @@ def identify_params(
     qd_ref = qd_true
     w_q = weight_q
     w_qd = weight_qd
+    seg_info = segments
+    seg_len = segment_len
 
     def objective_scaled(x_scaled: np.ndarray) -> float:
         x_physical = scaled_to_physical(x_scaled)
@@ -140,12 +144,27 @@ def identify_params(
         sim_ref.set_params(current)
 
         try:
-            traj = sim_ref.run(tau_ref, q0, qd0)
+            if seg_info is not None and seg_len is not None:
+                # 多段数据：分别用每段的初始条件仿真
+                q_pred_list, qd_pred_list = [], []
+                for seg_idx, (seg_q0, seg_qd0) in enumerate(seg_info):
+                    start = seg_idx * seg_len
+                    end = start + seg_len
+                    seg_tau = tau_ref[start:end]
+                    traj = sim_ref.run(seg_tau, seg_q0, seg_qd0)
+                    q_pred_list.append(traj["q"])
+                    qd_pred_list.append(traj["qd"])
+                q_pred = np.concatenate(q_pred_list)
+                qd_pred = np.concatenate(qd_pred_list)
+            else:
+                traj = sim_ref.run(tau_ref, q0, qd0)
+                q_pred = traj["q"]
+                qd_pred = traj["qd"]
         except Exception:
             return 1e12
 
-        q_err = traj["q"] - q_ref
-        qd_err = traj["qd"] - qd_ref
+        q_err = q_pred - q_ref
+        qd_err = qd_pred - qd_ref
         loss = w_q * np.mean(q_err**2) + w_qd * np.mean(qd_err**2)
 
         history["iter"].append(len(history["iter"]))
@@ -221,7 +240,7 @@ def identify_params(
         )
     elif method == "L-BFGS-B":
         bounds_scaled = [(0.0, 1.0)] * n_params
-        eps_val = 0.05
+        eps_val = 0.02
         if verbose:
             print(f"  eps={eps_val:.4f}")
         result = minimize(

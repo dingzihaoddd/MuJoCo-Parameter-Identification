@@ -227,17 +227,24 @@ def generate_training_data(
     if multi_q0 is not None:
         # 多个初始角度：在每个角度下运行仿真，拼接轨迹
         q_list, qd_list, tau_list = [], [], []
+        segment_indices = []  # 记录每个 segment 的 (start, end)
+        offset = 0
         for q0_val in multi_q0:
             traj = sim.run(tau_seq, q0_val, qd0)
+            seg_len = len(traj["q"])
             q_list.append(traj["q"])
             qd_list.append(traj["qd"])
             tau_list.append(tau_seq)
+            segment_indices.append((offset, offset + seg_len))
+            offset += seg_len
         return {
             "tau_seq": np.concatenate(tau_list),
             "q_true": np.concatenate(q_list),
             "qd_true": np.concatenate(qd_list),
             "dt": dt,
             "true_params": sim.get_params(),
+            "segments": [(q0, qd0) for q0 in multi_q0],
+            "segment_len": len(traj["q"]),  # 每个 segment 等长
         }
     else:
         traj = sim.run(tau_seq, q0, qd0)
