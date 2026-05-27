@@ -198,8 +198,8 @@ def _plot_results(result_dir, packed, d, f):
                 f"{err:.1f}%", ha="center", va="bottom", fontsize=10)
 
     plt.tight_layout()
-    plot_path = os.path.join(result_dir, "results.png")
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plot_path = os.path.join(result_dir, "results.pdf")
+    plt.savefig(plot_path, format="pdf", bbox_inches="tight")
     plt.close()
     print(f"  图表: {plot_path}")
 
