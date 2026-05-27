@@ -17,24 +17,51 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-SIM_DT = 0.01
-DUR = 2.0
-MULTI_Q0 = [np.deg2rad(a) for a in [30, 60, -20]]
+# ═══════════════════════════════════════════════════════════════
+# 仿真配置
+# ═══════════════════════════════════════════════════════════════
+SIM_DT = 0.01        # 仿真步长 (s)
+DUR = 2.0            # 每条轨迹时长 (s)
+MULTI_Q0_DEG = [30, 60, -20]               # 多组初始角度 (度)
+MULTI_Q0 = [np.deg2rad(a) for a in MULTI_Q0_DEG]
+
+# 激励信号
+EXCITATION = "sine"  # 激励类型: sine / sweep / multisine / random
+EXCITATION_FREQ = 0.7  # 正弦频率 (Hz)
+EXCITATION_AMP = 5.0   # 力矩幅值 (N·m)
+EXCITATION_SEED = 42    # 随机种子
+
+# 模型参数 (仅用于评估误差，不参与优化)
+TRUE_DAMPING = 0.1
+TRUE_FRICTION = 0.05
+
+# ═══════════════════════════════════════════════════════════════
+# 优化配置
+# ═══════════════════════════════════════════════════════════════
+OPT_METHOD = "L-BFGS-B"
+INITIAL_GUESS = [0.12, 0.06]  # 初始猜测 [damping, frictionloss]
+OPT_EPS = 0.02                 # 有限差分梯度步长
+OPT_MAXITER = 200              # 最大迭代次数
+OPT_BOUNDS = [(0.001, 0.5), (0.001, 0.3)]  # [damping, frictionloss] 搜索边界
+SUCCESS_THRESHOLD = 10         # 成功率阈值 (%)
+
+# ═══════════════════════════════════════════════════════════════
+# 路径
+# ═══════════════════════════════════════════════════════════════
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pendulum.xml")
-BOUNDS = [(0.001, 0.5), (0.001, 0.3)]
-TRUE_D, TRUE_F = 0.1, 0.05
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 
-def _generate_and_pack(sim_dt, dur, multi_q0, model_path):
+def _generate_and_pack():
     from src.simulator import Simulator
     from src.data_generator import generate_training_data
 
-    sim = Simulator(model_path, timestep=sim_dt)
+    sim = Simulator(MODEL_PATH, timestep=SIM_DT)
     data = generate_training_data(
-        sim, duration=dur, dt=sim_dt, excitation="sine",
-        f_start=0.7, amp=5.0, q0=np.deg2rad(30), qd0=0.0,
-        multi_q0=multi_q0, seed=42,
+        sim, duration=DUR, dt=SIM_DT, excitation=EXCITATION,
+        f_start=EXCITATION_FREQ, amp=EXCITATION_AMP,
+        q0=np.deg2rad(MULTI_Q0_DEG[0]), qd0=0.0,
+        multi_q0=MULTI_Q0, seed=EXCITATION_SEED,
     )
     return {
         "tau_seq": data["tau_seq"],
@@ -45,10 +72,10 @@ def _generate_and_pack(sim_dt, dur, multi_q0, model_path):
     }
 
 
-def _trajectory_loss(d, f, packed_data, model_path, sim_dt):
+def _trajectory_loss(d, f, packed_data):
     from src.simulator import Simulator
 
-    sim = Simulator(model_path, timestep=sim_dt)
+    sim = Simulator(MODEL_PATH, timestep=SIM_DT)
     sim.set_params({"damping": d, "frictionloss": f})
     qp_all, qdp_all = [], []
     for seg_idx, (seg_q0, seg_qd0) in enumerate(packed_data["segments"]):
@@ -62,10 +89,10 @@ def _trajectory_loss(d, f, packed_data, model_path, sim_dt):
     return float(np.mean((qd_pred - packed_data["qd_true"]) ** 2))
 
 
-def fmt(d, f, loss):
-    de = abs(d - TRUE_D) / TRUE_D * 100
-    fe = abs(f - TRUE_F) / TRUE_F * 100
-    ok = " ***" if de < 10 and fe < 10 else ""
+def _fmt(d, f, loss):
+    de = abs(d - TRUE_DAMPING) / TRUE_DAMPING * 100
+    fe = abs(f - TRUE_FRICTION) / TRUE_FRICTION * 100
+    ok = " ***" if de < SUCCESS_THRESHOLD and fe < SUCCESS_THRESHOLD else ""
     return f"d={d:.4f}({de:5.1f}%) f={f:.4f}({fe:5.1f}%) loss={loss:.6e}{ok}"
 
 
@@ -74,10 +101,11 @@ def _save_txt(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
     with open(path, "w", encoding="utf-8") as fp:
         fp.write("参数辨识优化结果\n")
         fp.write("=" * 60 + "\n\n")
-        fp.write(f"优化方法: L-BFGS-B (eps=0.02)\n")
+        fp.write(f"优化方法: {OPT_METHOD} (eps={OPT_EPS})\n")
         fp.write(f"仿真步长: {SIM_DT}s, 时长: {DUR}s\n")
-        fp.write(f"初始角度: {[np.rad2deg(a) for a in MULTI_Q0]} deg\n")
-        fp.write(f"初始猜测: d=0.12, f=0.06\n\n")
+        fp.write(f"初始角度: {MULTI_Q0_DEG} deg\n")
+        fp.write(f"激励信号: {EXCITATION} freq={EXCITATION_FREQ}Hz amp={EXCITATION_AMP}\n")
+        fp.write(f"初始猜测: d={INITIAL_GUESS[0]}, f={INITIAL_GUESS[1]}\n\n")
         fp.write(f"最终损失: {loss:.6e}\n")
         fp.write(f"迭代次数: {r.nit}\n")
         fp.write(f"函数调用: {r.nfev}\n")
@@ -86,13 +114,13 @@ def _save_txt(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
         fp.write(f"总耗时: {time.time() - t_total:.1f}s\n\n")
         fp.write(f"{'参数':<15s} {'真实值':>10s} {'辨识值':>10s} {'误差%':>10s}\n")
         fp.write("-" * 50 + "\n")
-        fp.write(f"{'damping':<15s} {TRUE_D:10.4f} {d:10.4f} {d_err:9.2f}%\n")
-        fp.write(f"{'frictionloss':<15s} {TRUE_F:10.4f} {f:10.4f} {f_err:9.2f}%\n")
+        fp.write(f"{'damping':<15s} {TRUE_DAMPING:10.4f} {d:10.4f} {d_err:9.2f}%\n")
+        fp.write(f"{'frictionloss':<15s} {TRUE_FRICTION:10.4f} {f:10.4f} {f_err:9.2f}%\n")
         fp.write("-" * 50 + "\n\n")
-        if d_err < 10 and f_err < 10:
-            fp.write("辨识成功! 两个参数误差均 < 10%\n")
+        if d_err < SUCCESS_THRESHOLD and f_err < SUCCESS_THRESHOLD:
+            fp.write(f"辨识成功! 两个参数误差均 < {SUCCESS_THRESHOLD}%\n")
         else:
-            fp.write("未达到 <10% 目标\n")
+            fp.write(f"未达到 <{SUCCESS_THRESHOLD}% 目标\n")
         fp.write("\n迭代历史:\n")
         fp.write(f"{'iter':>5s} {'d':>10s} {'f':>10s} {'loss':>12s}\n")
         fp.write("-" * 42 + "\n")
@@ -104,15 +132,23 @@ def _save_txt(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
 def _save_json(result_dir, d, f, d_err, f_err, loss, r, history, t_total, t1):
     path = os.path.join(result_dir, "result.json")
     result = {
-        "true_params": {"damping": TRUE_D, "frictionloss": TRUE_F},
+        "true_params": {"damping": TRUE_DAMPING, "frictionloss": TRUE_FRICTION},
         "identified_params": {"damping": float(d), "frictionloss": float(f)},
         "errors": {"damping_pct": d_err, "frictionloss_pct": f_err},
         "final_loss": float(loss),
-        "success": bool(d_err < 10 and f_err < 10),
-        "config": {"sim_dt": SIM_DT, "dur": DUR, "multi_q0_deg": [np.rad2deg(a) for a in MULTI_Q0]},
+        "success": bool(d_err < SUCCESS_THRESHOLD and f_err < SUCCESS_THRESHOLD),
+        "config": {
+            "sim_dt": SIM_DT, "dur": DUR,
+            "multi_q0_deg": MULTI_Q0_DEG,
+            "excitation": EXCITATION, "excitation_freq": EXCITATION_FREQ,
+            "excitation_amp": EXCITATION_AMP, "excitation_seed": EXCITATION_SEED,
+        },
         "timing": {"total_s": round(time.time() - t_total, 2), "optimization_s": round(time.time() - t1, 2)},
-        "optimization": {"method": "L-BFGS-B", "eps": 0.02, "maxiter": 200, "initial_guess": [0.12, 0.06],
-                          "nit": int(r.nit), "nfev": int(r.nfev), "message": str(r.message)},
+        "optimization": {
+            "method": OPT_METHOD, "eps": OPT_EPS, "maxiter": OPT_MAXITER,
+            "initial_guess": INITIAL_GUESS,
+            "nit": int(r.nit), "nfev": int(r.nfev), "message": str(r.message),
+        },
         "history": history,
     }
     with open(path, "w") as fp:
@@ -127,7 +163,6 @@ def _plot_results(result_dir, packed, d, f):
 
     plt.rcParams["axes.unicode_minus"] = False
 
-    # 用辨识参数仿真
     from src.simulator import Simulator
     sim = Simulator(MODEL_PATH, timestep=SIM_DT)
     sim.set_params({"damping": d, "frictionloss": f})
@@ -147,7 +182,6 @@ def _plot_results(result_dir, packed, d, f):
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fig.suptitle("Parameter Identification Results", fontsize=14)
 
-    # Position trajectory
     ax = axes[0, 0]
     ax.plot(t, packed["q_true"], "b-", alpha=0.5, linewidth=0.8, label="True")
     ax.plot(t, q_pred, "r--", alpha=0.7, linewidth=0.8, label="Identified")
@@ -157,7 +191,6 @@ def _plot_results(result_dir, packed, d, f):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Velocity trajectory
     ax = axes[0, 1]
     ax.plot(t, packed["qd_true"], "b-", alpha=0.5, linewidth=0.8, label="True")
     ax.plot(t, qd_pred, "r--", alpha=0.7, linewidth=0.8, label="Identified")
@@ -167,10 +200,9 @@ def _plot_results(result_dir, packed, d, f):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Parameter comparison
     ax = axes[1, 0]
     names = ["damping", "frictionloss"]
-    true_vals = [TRUE_D, TRUE_F]
+    true_vals = [TRUE_DAMPING, TRUE_FRICTION]
     ident_vals = [d, f]
     x = np.arange(len(names))
     width = 0.3
@@ -183,15 +215,16 @@ def _plot_results(result_dir, packed, d, f):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, axis="y")
 
-    # Error
     ax = axes[1, 1]
-    errors = [abs(d - TRUE_D) / TRUE_D * 100, abs(f - TRUE_F) / TRUE_F * 100]
-    colors = ["#2ecc71" if e < 10 else "#e74c3c" for e in errors]
+    errors = [abs(d - TRUE_DAMPING) / TRUE_DAMPING * 100,
+              abs(f - TRUE_FRICTION) / TRUE_FRICTION * 100]
+    colors = ["#2ecc71" if e < SUCCESS_THRESHOLD else "#e74c3c" for e in errors]
     bars = ax.bar(names, errors, color=colors)
     ax.set_ylabel("Relative Error (%)")
     ax.set_title("Identification Error")
     ax.grid(True, alpha=0.3, axis="y")
-    ax.axhline(y=10, color="orange", linestyle="--", linewidth=1, label="10% threshold")
+    ax.axhline(y=SUCCESS_THRESHOLD, color="orange", linestyle="--", linewidth=1,
+               label=f"{SUCCESS_THRESHOLD}% threshold")
     ax.legend(fontsize=8)
     for bar, err in zip(bars, errors):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
@@ -209,38 +242,36 @@ def main():
 
     t_total = time.time()
 
-    packed = _generate_and_pack(SIM_DT, DUR, MULTI_Q0, MODEL_PATH)
+    packed = _generate_and_pack()
     print(f"数据: {len(packed['tau_seq'])} 点 [{time.time() - t_total:.1f}s]")
-    print(f"真值校验: loss={_trajectory_loss(TRUE_D, TRUE_F, packed, MODEL_PATH, SIM_DT):.6e}")
+    print(f"真值校验: loss={_trajectory_loss(TRUE_DAMPING, TRUE_FRICTION, packed):.6e}")
 
-    # ── L-BFGS-B 从真值附近启动 ──
-    print(f"\n=== L-BFGS-B (eps=0.02) ===")
+    print(f"\n=== {OPT_METHOD} (eps={OPT_EPS}) ===")
     t1 = time.time()
 
     history = []
     def callback(xk):
-        loss = _trajectory_loss(xk[0], xk[1], packed, MODEL_PATH, SIM_DT)
+        loss = _trajectory_loss(xk[0], xk[1], packed)
         history.append({"d": float(xk[0]), "f": float(xk[1]), "loss": loss})
-        print(f"  iter {len(history):3d}: {fmt(xk[0], xk[1], loss)}")
+        print(f"  iter {len(history):3d}: {_fmt(xk[0], xk[1], loss)}")
 
     r = minimize(
-        lambda x: _trajectory_loss(x[0], x[1], packed, MODEL_PATH, SIM_DT),
-        [0.12, 0.06], method="L-BFGS-B", bounds=BOUNDS,
-        options={"maxiter": 200, "eps": 0.02},
+        lambda x: _trajectory_loss(x[0], x[1], packed),
+        INITIAL_GUESS, method=OPT_METHOD, bounds=OPT_BOUNDS,
+        options={"maxiter": OPT_MAXITER, "eps": OPT_EPS},
         callback=callback,
     )
     d_final, f_final = r.x
     loss_final = r.fun
 
-    print(f"\n  初始: (0.12, 0.06)")
-    print(f"  结果: {fmt(d_final, f_final, loss_final)}")
+    print(f"\n  初始: ({INITIAL_GUESS[0]}, {INITIAL_GUESS[1]})")
+    print(f"  结果: {_fmt(d_final, f_final, loss_final)}")
     print(f"  优化耗时: {time.time() - t1:.1f}s")
 
-    d_err = abs(d_final - TRUE_D) / TRUE_D * 100
-    f_err = abs(f_final - TRUE_F) / TRUE_F * 100
-    success = d_err < 10 and f_err < 10
+    d_err = abs(d_final - TRUE_DAMPING) / TRUE_DAMPING * 100
+    f_err = abs(f_final - TRUE_FRICTION) / TRUE_FRICTION * 100
+    success = d_err < SUCCESS_THRESHOLD and f_err < SUCCESS_THRESHOLD
 
-    # ── 保存结果 ──
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_dir = os.path.join(RESULTS_DIR, timestamp)
     os.makedirs(result_dir, exist_ok=True)
@@ -254,7 +285,7 @@ def main():
     if success:
         print("*** 辨识成功! ***")
     else:
-        print("未达到 <10% 目标")
+        print(f"未达到 <{SUCCESS_THRESHOLD}% 目标")
 
 
 if __name__ == "__main__":
