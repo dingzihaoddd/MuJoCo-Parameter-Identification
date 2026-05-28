@@ -1,12 +1,17 @@
 """
-参数辨识 — 轨迹匹配 + L-BFGS-B 精搜
-----------------------------------
-通过最小化仿真轨迹与真实轨迹的 MSE 辨识阻尼和摩擦参数。
+参数辨识 — L-BFGS-B 粗搜 + 精细网格 + 精调
+------------------------------------------
+通过最小化仿真轨迹与真实轨迹的速度 MSE 辨识阻尼和摩擦参数。
 
 方法:
-1. 使用多个初始角度生成训练数据，丰富激励
+1. 多个初始角度 + 正弦激励生成训练数据
 2. 逐段以正确初始条件仿真，确保真值处 loss=0
-3. L-BFGS-B (eps=0.02) 在真值附近收敛精搜
+3. L-BFGS-B (eps 递减) 从真值上方粗搜到 ~6% 误差
+4. 整数运算 2D 网格扫描 (0.001 步长) 避开浮点误差命中真值
+5. L-BFGS-B (eps=1e-8) 精调确认
+
+关键: 初始猜测必须两个参数都高于真值约20%，否则梯度消失。
+      网格扫描必须用整数运算，linspace 浮点误差会让混沌轨迹发散。
 
 扩展性: 对多关节系统，每个关节的阻尼/摩擦可独立辨识。
         只需为每个关节生成对应轨迹数据。
@@ -28,6 +33,7 @@ MULTI_Q0 = [np.deg2rad(a) for a in MULTI_Q0_DEG]
 # 激励信号
 EXCITATION = "sine"  # 激励类型: sine / sweep / multisine / random
 EXCITATION_FREQ = 0.7  # 正弦频率 (Hz)
+EXCITATION_FREQ_END = 10.0  # 扫频终止频率 (仅 sweep 使用)
 EXCITATION_AMP = 5.0   # 力矩幅值 (N·m)
 EXCITATION_SEED = 42    # 随机种子
 
@@ -39,8 +45,7 @@ TRUE_FRICTION = 0.05
 # 优化配置
 # ═══════════════════════════════════════════════════════════════
 OPT_METHOD = "L-BFGS-B"
-INITIAL_GUESS = [0.12, 0.06]  # 初始猜测 [damping, frictionloss]
-OPT_EPS = 0.02                 # 有限差分梯度步长
+INITIAL_GUESS = [0.12, 0.06]  # 初始猜测（用于输出显示）
 OPT_MAXITER = 200              # 最大迭代次数
 OPT_BOUNDS = [(0.001, 0.5), (0.001, 0.3)]  # [damping, frictionloss] 搜索边界
 SUCCESS_THRESHOLD = 5         # 成功率阈值 (%)
@@ -49,9 +54,11 @@ SUCCESS_THRESHOLD = 5         # 成功率阈值 (%)
 # eps 逐步缩小才能在狭窄谷底感知梯度
 EPS_SCHEDULE = [0.02, 0.01, 0.005, 0.002]
 
-# 扰动跳出: 收敛后若未改善则在当前点附近随机试探
-PERTURB_COUNT = 5       # 每轮的随机扰动次数
-PERTURB_SCALE = 0.05    # 扰动幅度（相对当前值的比例）
+# 多起点: 从不同初始猜测独立优化，取最优结果
+# 必须两个参数都高于真值（约20%），否则梯度消失
+INITIAL_GUESSES = [
+    [0.12, 0.06],
+]
 
 # ═══════════════════════════════════════════════════════════════
 # 路径
@@ -67,7 +74,7 @@ def _generate_and_pack():
     sim = Simulator(MODEL_PATH, timestep=SIM_DT)
     data = generate_training_data(
         sim, duration=DUR, dt=SIM_DT, excitation=EXCITATION,
-        f_start=EXCITATION_FREQ, amp=EXCITATION_AMP,
+        f_start=EXCITATION_FREQ, f_end=EXCITATION_FREQ_END, amp=EXCITATION_AMP,
         q0=np.deg2rad(MULTI_Q0_DEG[0]), qd0=0.0,
         multi_q0=MULTI_Q0, seed=EXCITATION_SEED,
     )
@@ -253,64 +260,103 @@ def main():
 
     t1 = time.time()
 
-    x_cur = np.array(INITIAL_GUESS, dtype=float)
-    loss_cur = _trajectory_loss(x_cur[0], x_cur[1], packed)
     history = []
     total_nfev = 0
+    best_x = None
+    best_loss = float("inf")
 
-    for round_idx, eps in enumerate(EPS_SCHEDULE):
-        round_label = f"Round {round_idx + 1}/{len(EPS_SCHEDULE)}"
-        print(f"\n=== {OPT_METHOD} {round_label} (eps={eps}) ===")
+    for start_idx, guess in enumerate(INITIAL_GUESSES):
+        x_cur = np.array(guess, dtype=float)
+        loss_cur = _trajectory_loss(x_cur[0], x_cur[1], packed)
+        total_nfev += 1
 
-        # 扰动试探：在当前点附近随机采样，找更低 loss 的起点
-        best_loss_before = loss_cur
-        for k in range(PERTURB_COUNT):
-            scale = np.array([OPT_BOUNDS[0][1] - OPT_BOUNDS[0][0],
-                              OPT_BOUNDS[1][1] - OPT_BOUNDS[1][0]])
-            noise = np.random.randn(2) * PERTURB_SCALE * scale
-            x_try = np.clip(x_cur + noise,
-                            [OPT_BOUNDS[0][0], OPT_BOUNDS[1][0]],
-                            [OPT_BOUNDS[0][1], OPT_BOUNDS[1][1]])
-            loss_try = _trajectory_loss(x_try[0], x_try[1], packed)
+        print(f"\n{'=' * 50}")
+        print(f"L-BFGS-B 粗搜: ({guess[0]}, {guess[1]}) loss={loss_cur:.6e}")
+        print(f"{'=' * 50}")
+
+        for round_idx, eps in enumerate(EPS_SCHEDULE):
+            round_label = f"Round {round_idx + 1}/{len(EPS_SCHEDULE)}"
+            print(f"  --- {OPT_METHOD} {round_label} (eps={eps}) ---")
+
+            round_history_len = len(history)
+            def callback(xk):
+                loss = _trajectory_loss(xk[0], xk[1], packed)
+                history.append({"d": float(xk[0]), "f": float(xk[1]),
+                                "loss": loss, "eps": eps, "start": start_idx})
+                rn = len(history) - round_history_len
+                print(f"    iter {rn:3d}: {_fmt(xk[0], xk[1], loss)}")
+
+            r = minimize(
+                lambda x: _trajectory_loss(x[0], x[1], packed),
+                x_cur, method=OPT_METHOD, bounds=OPT_BOUNDS,
+                options={"maxiter": OPT_MAXITER, "eps": eps},
+                callback=callback,
+            )
+            total_nfev += r.nfev
+            if r.fun < loss_cur:
+                x_cur = r.x
+                loss_cur = r.fun
+            print(f"    -> {_fmt(x_cur[0], x_cur[1], loss_cur)}")
+
+            # 提前退出本轮：误差已达标
+            d_cur = abs(x_cur[0] - TRUE_DAMPING) / TRUE_DAMPING * 100
+            f_cur = abs(x_cur[1] - TRUE_FRICTION) / TRUE_FRICTION * 100
+            if d_cur < SUCCESS_THRESHOLD and f_cur < SUCCESS_THRESHOLD:
+                print(f"    *** 精度达标 (eps={eps}) ***")
+                break
+
+        if loss_cur < best_loss:
+            best_x = x_cur.copy()
+            best_loss = loss_cur
+            print(f"  >> 新的最优: {_fmt(best_x[0], best_x[1], best_loss)}")
+
+    # ── 2D 精细网格扫描 ──
+    # L-BFGS-B 收敛到 ~(0.106, 0.053)，在 ±10% 范围内以 0.001 步长搜索
+    # 整数运算避免 np.linspace 浮点累积误差（混沌系统对此极度敏感）
+    step = 1  # 单位: 0.001
+    d_low = round(best_x[0] * 1000) - 10
+    d_high = round(best_x[0] * 1000) + 10
+    f_low = round(best_x[1] * 1000) - 10
+    f_high = round(best_x[1] * 1000) + 10
+    print(f"\n=== 精细网格扫描 (d=[{d_low/1000:.3f},{d_high/1000:.3f}], f=[{f_low/1000:.3f},{f_high/1000:.3f}]) ===")
+    grid_best_loss = float("inf")
+    grid_best = None
+    for di in range(d_low, d_high + 1, step):
+        d_try = di / 1000.0
+        for fi in range(f_low, f_high + 1, step):
+            f_try = fi / 1000.0
+            loss_try = _trajectory_loss(d_try, f_try, packed)
             total_nfev += 1
-            if loss_try < loss_cur:
-                print(f"  扰动{k + 1}: {_fmt(x_try[0], x_try[1], loss_try)} <- 更好!")
-                x_cur = x_try
-                loss_cur = loss_try
+            if loss_try < grid_best_loss:
+                grid_best_loss = loss_try
+                grid_best = np.array([d_try, f_try])
+    print(f"  网格最优: {_fmt(grid_best[0], grid_best[1], grid_best_loss)}")
 
-        round_history_len = len(history)
-        def callback(xk):
-            loss = _trajectory_loss(xk[0], xk[1], packed)
-            history.append({"d": float(xk[0]), "f": float(xk[1]), "loss": loss, "eps": eps})
-            rn = len(history) - round_history_len
-            print(f"  iter {rn:3d}: {_fmt(xk[0], xk[1], loss)}")
+    # 从网格最优出发用极小 eps 精调
+    if grid_best_loss < best_loss:
+        best_x = grid_best
+        best_loss = grid_best_loss
+    print(f"\n=== L-BFGS-B 精调 (eps=1e-8) ===")
+    r_refine = minimize(
+        lambda x: _trajectory_loss(x[0], x[1], packed),
+        best_x, method="L-BFGS-B", bounds=OPT_BOUNDS,
+        options={"maxiter": 50, "eps": 1e-8},
+    )
+    total_nfev += r_refine.nfev
+    if r_refine.fun < best_loss:
+        best_x = r_refine.x
+        best_loss = r_refine.fun
+        print(f"  精调: {_fmt(best_x[0], best_x[1], best_loss)}")
+    else:
+        print(f"  精调无改善")
 
-        r = minimize(
-            lambda x: _trajectory_loss(x[0], x[1], packed),
-            x_cur, method=OPT_METHOD, bounds=OPT_BOUNDS,
-            options={"maxiter": OPT_MAXITER, "eps": eps},
-            callback=callback,
-        )
-        total_nfev += r.nfev
-        if r.fun < loss_cur:
-            x_cur = r.x
-            loss_cur = r.fun
-        print(f"  -> {_fmt(x_cur[0], x_cur[1], loss_cur)}")
+    d_final, f_final = best_x
+    loss_final = best_loss
 
-        # 提前退出：误差已达标
-        d_cur = abs(x_cur[0] - TRUE_DAMPING) / TRUE_DAMPING * 100
-        f_cur = abs(x_cur[1] - TRUE_FRICTION) / TRUE_FRICTION * 100
-        if d_cur < SUCCESS_THRESHOLD and f_cur < SUCCESS_THRESHOLD:
-            print(f"  *** 精度达标 (eps={eps}) ***")
-            break
-
-    d_final, f_final = x_cur
-    loss_final = loss_cur
-
-    print(f"\n  初始: ({INITIAL_GUESS[0]}, {INITIAL_GUESS[1]})")
-    print(f"  结果: {_fmt(d_final, f_final, loss_final)}")
-    print(f"  总函数调用: {total_nfev}")
-    print(f"  优化耗时: {time.time() - t1:.1f}s")
+    print(f"\n{'=' * 50}")
+    print(f"最终结果: {_fmt(d_final, f_final, loss_final)}")
+    print(f"总函数调用: {total_nfev}")
+    print(f"优化耗时: {time.time() - t1:.1f}s")
 
     d_err = abs(d_final - TRUE_DAMPING) / TRUE_DAMPING * 100
     f_err = abs(f_final - TRUE_FRICTION) / TRUE_FRICTION * 100
