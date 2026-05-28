@@ -2,15 +2,8 @@
 Parameter identification using 1-step prediction loss + L-BFGS-B.
 --------------------------------------------------------------
 Single-step MuJoCo prediction from true state avoids chaos
-accumulation. The loss surface is smooth, enabling L-BFGS-B
-to converge near the true values reliably.
-
-Key insight: chaos arises from accumulation of small errors
-over many simulation steps. A single MuJoCo step from true
-state has no accumulation, giving a smooth loss.
-
-The approach generalizes to multi-DOF systems by applying
-1-step prediction per DOF trajectory.
+accumulation. Uses RK4 integrator (default from XML) which handles
+friction smoothly via higher-order integration.
 """
 import os, sys, time, json
 from datetime import datetime
@@ -255,7 +248,14 @@ def main():
 
     packed = _generate_and_pack()
     print(f"Data: {len(packed['tau_seq'])} points [{time.time() - t_total:.1f}s]")
-    print(f"1-step loss at truth: {_one_step_loss(TRUE_DAMPING, TRUE_FRICTION, packed):.6e}")
+    loss_truth = _one_step_loss(TRUE_DAMPING, TRUE_FRICTION, packed)
+    print(f"1-step loss at truth: {loss_truth:.6e}")
+
+    # Data diagnostics
+    all_qd = np.concatenate([packed["qd_true"][i * packed["segment_len"]:(i + 1) * packed["segment_len"]]
+                             for i in range(len(packed["segments"]))])
+    print(f"Velocity stats: RMS={np.sqrt(np.mean(all_qd**2)):.1f}, "
+          f"|qd|<0.5: {np.sum(np.abs(all_qd)<0.5)}/{len(all_qd)}")
 
     t1 = time.time()
     history = []
@@ -268,7 +268,8 @@ def main():
     print(f"{'=' * 50}")
     print(f"  Start: {_fmt(x_cur[0], x_cur[1], _one_step_loss(x_cur[0], x_cur[1], packed))}")
 
-    for eps in [0.02, 0.01, 0.005, 0.002, 0.001]:
+    eps_seq = [0.02, 0.01, 0.005, 0.002, 0.001]
+    for eps in eps_seq:
         round_hist_len = len(history)
         def callback(xk):
             loss = _one_step_loss(xk[0], xk[1], packed)
@@ -288,12 +289,6 @@ def main():
         loss_cur = _one_step_loss(x_cur[0], x_cur[1], packed)
         total_nfev += 1
         print(f"    -> {_fmt(x_cur[0], x_cur[1], loss_cur)}")
-
-        de = abs(x_cur[0] - TRUE_DAMPING) / TRUE_DAMPING * 100
-        fe = abs(x_cur[1] - TRUE_FRICTION) / TRUE_FRICTION * 100
-        if de < SUCCESS_THRESHOLD and fe < SUCCESS_THRESHOLD:
-            print(f"    *** SUCCESS (eps={eps}) ***")
-            break
 
     d_final = float(x_cur[0])
     f_final = float(x_cur[1])
