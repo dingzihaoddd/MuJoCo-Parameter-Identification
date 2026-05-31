@@ -6,7 +6,7 @@
   <compiler angle="radian" />
 
   <option timestep="0.001" integrator="RK4">
-    <flag gravity="enable" />
+    <flag gravity="enable" contact="disable" />
   </option>
 
   <default>
