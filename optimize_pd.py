@@ -31,8 +31,8 @@ TRAJ_CONFIGS = [
     {"type": "sine",  "duration": 2.0, "amp": 0.5, "frequency": 0.7,  "q0": np.deg2rad(-20)},
     {"type": "sine",  "duration": 2.0, "amp": 1.0, "frequency": 0.3,  "q0": np.deg2rad(45)},
     # 低速轨迹: 小幅值低频，速度主要走 sign 切换区，区分 frictionloss
-    {"type": "sine",  "duration": 3.0, "amp": 0.05, "frequency": 0.15},
-    {"type": "sine",  "duration": 3.0, "amp": 0.03, "frequency": 0.1,  "q0": np.deg2rad(10)},
+    {"type": "sine",  "duration": 3.0, "amp": 0.08, "frequency": 0.15},
+    {"type": "sine",  "duration": 3.0, "amp": 0.30, "frequency": 0.1,  "q0": np.deg2rad(10)},
 ]
 
 INITIAL_GUESS = [0.12, 0.06]
