@@ -17,9 +17,6 @@ SIM_DT = 0.01
 PD_KP = 30.0
 PD_KD = 2.0
 
-TRUE_DAMPING = 0.1
-TRUE_FRICTION = 0.05
-
 # 参考轨迹配置: 不同频率/幅值/初始角度，参考起始位置与q0一致
 TRAJ_CONFIGS = [
     {"type": "sine",  "duration": 2.0, "amp": 0.3, "frequency": 0.3},
@@ -42,6 +39,10 @@ SUCCESS_THRESHOLD = 1
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pendulum.xml")
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
+# 从模型读取的真值（main() 中初始化）
+_TRUE_D = None
+_TRUE_F = None
 
 
 # =====================================================================
@@ -89,7 +90,8 @@ def _sweep_ref(duration, dt, amp, f_start, f_end):
 def _generate_data():
     from src.simulator import Simulator
     sim = Simulator(MODEL_PATH, timestep=SIM_DT)
-    sim.set_params({"damping": TRUE_DAMPING, "frictionloss": TRUE_FRICTION})
+    # 不覆盖参数，直接从模型读取真值
+    true_params = sim.get_params()
 
     trajectories = []
     for cfg in TRAJ_CONFIGS:
@@ -152,8 +154,8 @@ def _one_step_loss(d, f, trajectories):
 # Output helpers
 # =====================================================================
 def _fmt(d, f, loss):
-    de = abs(d - TRUE_DAMPING) / TRUE_DAMPING * 100
-    fe = abs(f - TRUE_FRICTION) / TRUE_FRICTION * 100
+    de = abs(d - _TRUE_D) / _TRUE_D * 100
+    fe = abs(f - _TRUE_F) / _TRUE_F * 100
     ok = " ***" if de < SUCCESS_THRESHOLD and fe < SUCCESS_THRESHOLD else ""
     return f"d={d:.4f}({de:5.1f}%) f={f:.4f}({fe:5.1f}%) loss={loss:.6e}{ok}"
 
@@ -188,8 +190,8 @@ def _save_results(result_dir, d, f, d_err, f_err, loss, opt_info, history, t_tot
         fp.write(f"Total time: {time.time() - t_total:.1f}s\n\n")
         fp.write(f"{'Param':<15s} {'True':>10s} {'Identified':>10s} {'Error%':>10s}\n")
         fp.write("-" * 50 + "\n")
-        fp.write(f"{'damping':<15s} {TRUE_DAMPING:10.4f} {d:10.4f} {d_err:9.2f}%\n")
-        fp.write(f"{'frictionloss':<15s} {TRUE_FRICTION:10.4f} {f:10.4f} {f_err:9.2f}%\n")
+        fp.write(f"{'damping':<15s} {_TRUE_D:10.4f} {d:10.4f} {d_err:9.2f}%\n")
+        fp.write(f"{'frictionloss':<15s} {_TRUE_F:10.4f} {f:10.4f} {f_err:9.2f}%\n")
         fp.write("-" * 50 + "\n\n")
         if d_err < SUCCESS_THRESHOLD and f_err < SUCCESS_THRESHOLD:
             fp.write(f"SUCCESS: both < {SUCCESS_THRESHOLD}%\n")
@@ -203,7 +205,7 @@ def _save_results(result_dir, d, f, d_err, f_err, loss, opt_info, history, t_tot
     jpath = os.path.join(result_dir, "result.json")
     with open(jpath, "w") as fp:
         json.dump({
-            "true": {"damping": TRUE_DAMPING, "frictionloss": TRUE_FRICTION},
+            "true": {"damping": _TRUE_D, "frictionloss": _TRUE_F},
             "identified": {"damping": float(d), "frictionloss": float(f)},
             "errors_pct": {"damping": d_err, "frictionloss": f_err},
             "final_loss": float(loss),
@@ -266,6 +268,13 @@ def _plot_results(result_dir, trajectories, d, f):
 # =====================================================================
 def main():
     from scipy.optimize import minimize
+    from src.simulator import Simulator
+
+    global _TRUE_D, _TRUE_F
+    sim = Simulator(MODEL_PATH, timestep=SIM_DT)
+    p = sim.get_params()
+    _TRUE_D, _TRUE_F = float(p["damping"]), float(p["frictionloss"])
+    print(f"True params from model: damping={_TRUE_D:.4f} frictionloss={_TRUE_F:.4f}")
 
     t_total = time.time()
 
@@ -277,7 +286,7 @@ def main():
 
     _print_diagnostics(trajectories)
 
-    loss_truth = _one_step_loss(TRUE_DAMPING, TRUE_FRICTION, trajectories)
+    loss_truth = _one_step_loss(_TRUE_D, _TRUE_F, trajectories)
     print(f"Loss at truth: {loss_truth:.6e}")
 
     all_qd = np.concatenate([t["qd_true"] for t in trajectories])
@@ -337,8 +346,8 @@ def main():
     print(f"Final: {_fmt(d_final, f_final, loss_final)}")
     print(f"Evals: {total_nfev}, opt time: {time.time()-t1:.1f}s")
 
-    d_err = abs(d_final - TRUE_DAMPING) / TRUE_DAMPING * 100
-    f_err = abs(f_final - TRUE_FRICTION) / TRUE_FRICTION * 100
+    d_err = abs(d_final - _TRUE_D) / _TRUE_D * 100
+    f_err = abs(f_final - _TRUE_F) / _TRUE_F * 100
 
     # 3. Save
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
