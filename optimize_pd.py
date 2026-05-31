@@ -38,6 +38,7 @@ TRAJ_CONFIGS = [
 INITIAL_GUESS = [0.12, 0.06]
 OPT_MAXITER = 2000
 OPT_BOUNDS = [(0.001, 0.5), (0.001, 0.3)]
+LOSS_ALPHA = 0.5  # 0=纯1-step, 1=纯开环
 SUCCESS_THRESHOLD = 1
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pendulum.xml")
@@ -116,8 +117,22 @@ def _generate_data():
 
 
 # =====================================================================
-# Loss: 1-step prediction MSE (reset to true state each step)
+# Loss functions
 # =====================================================================
+def _open_loop_loss(d, f, trajectories):
+    """用记录的PD力矩序列跑开环仿真，对比全轨迹 MSE。"""
+    from src.simulator import Simulator
+    sim = Simulator(MODEL_PATH, timestep=SIM_DT)
+    sim.set_params({"damping": d, "frictionloss": f})
+
+    total = 0.0
+    for t in trajectories:
+        traj = sim.run(t["tau_true"], t["q0"], t["qd0"])
+        total += np.mean((traj["q"] - t["q_true"]) ** 2)
+        total += 0.01 * np.mean((traj["qd"] - t["qd_true"]) ** 2)
+    return float(total)
+
+
 def _one_step_loss(d, f, trajectories):
     """每步从真实状态重置，施加PD力矩走一步，对比预测速度与真实速度。"""
     from src.simulator import Simulator
@@ -146,6 +161,12 @@ def _one_step_loss(d, f, trajectories):
             total_points += 1
 
     return float(total_err / total_points)
+
+
+def _loss(d, f, trajectories):
+    """开环全轨迹MSE + 1-step预测MSE 加权求和。"""
+    return (LOSS_ALPHA * _open_loop_loss(d, f, trajectories)
+            + (1 - LOSS_ALPHA) * _one_step_loss(d, f, trajectories))
 
 
 # =====================================================================
@@ -178,7 +199,7 @@ def _save_results(result_dir, d, f, d_err, f_err, loss, opt_info, history, t_tot
     with open(path, "w", encoding="utf-8") as fp:
         fp.write("Parameter Identification (PD Servo + Multi Trajectory)\n")
         fp.write("=" * 60 + "\n\n")
-        fp.write(f"Method: L-BFGS-B, 1-step prediction MSE\n")
+        fp.write(f"Method: L-BFGS-B (+ Nelder-Mead), combined loss (α={LOSS_ALPHA})\n")
         fp.write(f"dt={SIM_DT}s, Kp={PD_KP}, Kd={PD_KD}\n")
         fp.write(f"Trajectories: {len(TRAJ_CONFIGS)}\n")
         fp.write(f"Initial guess: d={INITIAL_GUESS[0]}, f={INITIAL_GUESS[1]}\n\n")
@@ -233,7 +254,8 @@ def _plot_results(result_dir, trajectories, d, f):
 
     for idx, (t, ax) in enumerate(zip(trajectories, axes.flat)):
         cfg = t["config"]
-        q_pred, _, _ = _run_pd_traj(sim, t["q_ref"], t["q0"], t["qd0"])
+        traj = sim.run(t["tau_true"], t["q0"], t["qd0"])
+        q_pred = traj["q"]
         time_axis = np.arange(len(t["q_ref"])) * SIM_DT
 
         ax.plot(time_axis, t["q_ref"], "k:", alpha=0.35, lw=0.8, label="ref")
@@ -277,8 +299,9 @@ def main():
 
     _print_diagnostics(trajectories)
 
-    loss_truth = _one_step_loss(TRUE_DAMPING, TRUE_FRICTION, trajectories)
-    print(f"Loss at truth: {loss_truth:.6e}")
+    loss_ol = _open_loop_loss(TRUE_DAMPING, TRUE_FRICTION, trajectories)
+    loss_1s = _one_step_loss(TRUE_DAMPING, TRUE_FRICTION, trajectories)
+    print(f"Loss at truth: open_loop={loss_ol:.2e}  1-step={loss_1s:.2e}")
 
     all_qd = np.concatenate([t["qd_true"] for t in trajectories])
     print(f"Velocity: RMS={np.sqrt(np.mean(all_qd**2)):.2f} max|qd|={np.max(np.abs(all_qd)):.2f}")
@@ -290,48 +313,48 @@ def main():
     x_cur = np.array(INITIAL_GUESS, dtype=float)
 
     print(f"\n{'='*50}")
-    print(f"L-BFGS-B, 1-step prediction MSE")
+    print(f"L-BFGS-B, combined loss (α={LOSS_ALPHA})")
     print(f"{'='*50}")
-    print(f"  Start: {_fmt(x_cur[0], x_cur[1], _one_step_loss(x_cur[0], x_cur[1], trajectories))}")
+    print(f"  Start: {_fmt(x_cur[0], x_cur[1], _loss(x_cur[0], x_cur[1], trajectories))}")
 
     eps_seq = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002]
     for eps in eps_seq:
         round_start = len(history)
 
         def cb(xk):
-            loss = _one_step_loss(xk[0], xk[1], trajectories)
+            loss = _loss(xk[0], xk[1], trajectories)
             history.append({"d": float(xk[0]), "f": float(xk[1]), "loss": loss, "eps": eps})
             rn = len(history) - round_start
             print(f"    {rn:3d}: {_fmt(xk[0], xk[1], loss)}")
 
         r = minimize(
-            lambda x: _one_step_loss(x[0], x[1], trajectories),
+            lambda x: _loss(x[0], x[1], trajectories),
             x_cur, method="L-BFGS-B", bounds=OPT_BOUNDS,
-            options={"maxiter": OPT_MAXITER, "eps": eps, "gtol": 1e-12}, callback=cb,
+            options={"maxiter": OPT_MAXITER, "eps": eps}, callback=cb,
         )
         total_nfev += r.nfev
-        if r.fun < _one_step_loss(x_cur[0], x_cur[1], trajectories):
+        if r.fun < _loss(x_cur[0], x_cur[1], trajectories):
             x_cur = r.x
-        loss_cur = _one_step_loss(x_cur[0], x_cur[1], trajectories)
+        loss_cur = _loss(x_cur[0], x_cur[1], trajectories)
         total_nfev += 1
         print(f"    -> {_fmt(x_cur[0], x_cur[1], loss_cur)}")
 
     # Nelder-Mead refinement for the narrow coupling valley
     print(f"\n  Nelder-Mead refinement...")
     r_nm = minimize(
-        lambda x: _one_step_loss(x[0], x[1], trajectories),
+        lambda x: _loss(x[0], x[1], trajectories),
         x_cur, method="Nelder-Mead",
         options={"maxiter": 500, "xatol": 1e-10, "fatol": 1e-20},
         callback=lambda xk: None,
     )
-    if r_nm.fun < _one_step_loss(x_cur[0], x_cur[1], trajectories):
+    if r_nm.fun < _loss(x_cur[0], x_cur[1], trajectories):
         x_cur = r_nm.x
         history.append({"d": float(x_cur[0]), "f": float(x_cur[1]), "loss": float(r_nm.fun), "eps": "NM"})
     total_nfev += r_nm.nfev
-    print(f"    NM -> {_fmt(x_cur[0], x_cur[1], _one_step_loss(x_cur[0], x_cur[1], trajectories))}")
+    print(f"    NM -> {_fmt(x_cur[0], x_cur[1], _loss(x_cur[0], x_cur[1], trajectories))}")
 
     d_final, f_final = float(x_cur[0]), float(x_cur[1])
-    loss_final = _one_step_loss(d_final, f_final, trajectories)
+    loss_final = _loss(d_final, f_final, trajectories)
 
     print(f"\n{'='*50}")
     print(f"Final: {_fmt(d_final, f_final, loss_final)}")
